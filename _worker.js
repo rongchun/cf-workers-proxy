@@ -1,163 +1,200 @@
-addEventListener("fetch", (event) => {
-  event.passThroughOnException();
-  event.respondWith(handleRequest(event.request));
-});
-
-const dockerHub = "https://registry-1.docker.io";
-
-const routes = {
-  // production
-  "docker.susyun.com": dockerHub,
-  "quay.susyun.com": "https://quay.io",
-  "gcr.susyun.com": "https://gcr.io",
-  "k8s-gcr.susyun.com": "https://k8s.gcr.io",
-  "k8s.susyun.com": "https://registry.k8s.io",
-  "ghcr.susyun.com": "https://ghcr.io",
-  "cloudsmith.susyun.com": "https://docker.cloudsmith.io",
-  "ecr.susyun.com": "https://public.ecr.aws",
-
-  // staging
-  "docker-staging.susyun.com": dockerHub,
-};
-
-function routeByHosts(host) {
-  if (host in routes) {
-    return routes[host];
-  }
-  if (MODE == "debug") {
-    return TARGET_UPSTREAM;
-  }
-  return "";
+function logError(request, message) {
+  console.error(
+    `${message}, clientIp: ${request.headers.get(
+      "cf-connecting-ip"
+    )}, user-agent: ${request.headers.get("user-agent")}, url: ${request.url}`
+  );
 }
 
-async function handleRequest(request) {
-  const url = new URL(request.url);
-  const upstream = routeByHosts(url.hostname);
-  if (upstream === "") {
-    return new Response(
-      JSON.stringify({
-        routes: routes,
-      }),
-      {
-        status: 404,
-      }
-    );
-  }
-  const isDockerHub = upstream == dockerHub;
-  const authorization = request.headers.get("Authorization");
-  if (url.pathname == "/v2/") {
-    const newUrl = new URL(upstream + "/v2/");
-    const headers = new Headers();
-    if (authorization) {
-      headers.set("Authorization", authorization);
-    }
-    // check if need to authenticate
-    const resp = await fetch(newUrl.toString(), {
-      method: "GET",
-      headers: headers,
-      redirect: "follow",
-    });
-    if (resp.status === 401) {
-      return responseUnauthorized(url);
-    }
-    return resp;
-  }
-  // get token
-  if (url.pathname == "/v2/auth") {
-    const newUrl = new URL(upstream + "/v2/");
-    const resp = await fetch(newUrl.toString(), {
-      method: "GET",
-      redirect: "follow",
-    });
-    if (resp.status !== 401) {
-      return resp;
-    }
-    const authenticateStr = resp.headers.get("WWW-Authenticate");
-    if (authenticateStr === null) {
-      return resp;
-    }
-    const wwwAuthenticate = parseAuthenticate(authenticateStr);
-    let scope = url.searchParams.get("scope");
-    // autocomplete repo part into scope for DockerHub library images
-    // Example: repository:busybox:pull => repository:library/busybox:pull
-    if (scope && isDockerHub) {
-      let scopeParts = scope.split(":");
-      if (scopeParts.length == 3 && !scopeParts[1].includes("/")) {
-        scopeParts[1] = "library/" + scopeParts[1];
-        scope = scopeParts.join(":");
-      }
-    }
-    return await fetchToken(wwwAuthenticate, scope, authorization);
-  }
-  // redirect for DockerHub library images
-  // Example: /v2/busybox/manifests/latest => /v2/library/busybox/manifests/latest
-  if (isDockerHub) {
-    const pathParts = url.pathname.split("/");
-    if (pathParts.length == 5) {
-      pathParts.splice(2, 0, "library");
-      const redirectUrl = new URL(url);
-      redirectUrl.pathname = pathParts.join("/");
-      return Response.redirect(redirectUrl, 301);
+function createNewRequest(request, url, proxyHostname, originHostname) {
+  const newRequestHeaders = new Headers(request.headers);
+  for (const [key, value] of newRequestHeaders) {
+    if (value.includes(originHostname)) {
+      newRequestHeaders.set(
+        key,
+        value.replace(
+          new RegExp(`(?<!\\.)\\b${originHostname}\\b`, "g"),
+          proxyHostname
+        )
+      );
     }
   }
-  // foward requests
-  const newUrl = new URL(upstream + url.pathname);
-  const newReq = new Request(newUrl, {
+  return new Request(url.toString(), {
     method: request.method,
-    headers: request.headers,
-    redirect: "follow",
+    headers: newRequestHeaders,
+    body: request.body,
+    redirect: 'follow'
   });
-  const resp = await fetch(newReq);
-  if (resp.status == 401) {
-    return responseUnauthorized(url);
-  }
-  return resp;
 }
 
-function parseAuthenticate(authenticateStr) {
-  // sample: Bearer realm="https://auth.ipv6.docker.com/token",service="registry.docker.io"
-  // match strings after =" and before "
-  const re = /(?<=\=")(?:\\.|[^"\\])*(?=")/g;
-  const matches = authenticateStr.match(re);
-  if (matches == null || matches.length < 2) {
-    throw new Error(`invalid Www-Authenticate Header: ${authenticateStr}`);
+function setResponseHeaders(
+  originalResponse,
+  proxyHostname,
+  originHostname,
+  DEBUG
+) {
+  const newResponseHeaders = new Headers(originalResponse.headers);
+  for (const [key, value] of newResponseHeaders) {
+    if (value.includes(proxyHostname)) {
+      newResponseHeaders.set(
+        key,
+        value.replace(
+          new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
+          originHostname
+        )
+      );
+    }
   }
-  return {
-    realm: matches[0],
-    service: matches[1],
-  };
+  if (DEBUG) {
+    newResponseHeaders.delete("content-security-policy");
+  }
+  return newResponseHeaders;
 }
 
-async function fetchToken(wwwAuthenticate, scope, authorization) {
-  const url = new URL(wwwAuthenticate.realm);
-  if (wwwAuthenticate.service.length) {
-    url.searchParams.set("service", wwwAuthenticate.service);
-  }
-  if (scope) {
-    url.searchParams.set("scope", scope);
-  }
-  const headers = new Headers();
-  if (authorization) {
-    headers.set("Authorization", authorization);
-  }
-  return await fetch(url, { method: "GET", headers: headers });
-}
-
-function responseUnauthorized(url) {
-  const headers = new(Headers);
-  if (MODE == "debug") {
-    headers.set(
-      "Www-Authenticate",
-      `Bearer realm="http://${url.host}/v2/auth",service="cloudflare-docker-proxy"`
+/**
+ * 替换内容
+ * @param originalResponse 响应
+ * @param proxyHostname 代理地址 hostname
+ * @param pathnameRegex 代理地址路径匹配的正则表达式
+ * @param originHostname 替换的字符串
+ * @returns {Promise<*>}
+ */
+async function replaceResponseText(
+  originalResponse,
+  proxyHostname,
+  pathnameRegex,
+  originHostname
+) {
+  let text = await originalResponse.text();
+  if (pathnameRegex) {
+    pathnameRegex = pathnameRegex.replace(/^\^/, "");
+    return text.replace(
+      new RegExp(`((?<!\\.)\\b${proxyHostname}\\b)(${pathnameRegex})`, "g"),
+      `${originHostname}$2`
     );
   } else {
-    headers.set(
-      "Www-Authenticate",
-      `Bearer realm="https://${url.hostname}/v2/auth",service="cloudflare-docker-proxy"`
+    return text.replace(
+      new RegExp(`(?<!\\.)\\b${proxyHostname}\\b`, "g"),
+      originHostname
     );
   }
-  return new Response(JSON.stringify({ message: "UNAUTHORIZED" }), {
-    status: 401,
-    headers: headers,
-  });
 }
+
+async function nginx() {
+  return `<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto;
+font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>`;
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    try {
+      const {
+        PROXY_HOSTNAME,
+        PROXY_PROTOCOL = "https",
+        PATHNAME_REGEX,
+        UA_WHITELIST_REGEX,
+        UA_BLACKLIST_REGEX,
+        URL302,
+        IP_WHITELIST_REGEX,
+        IP_BLACKLIST_REGEX,
+        REGION_WHITELIST_REGEX,
+        REGION_BLACKLIST_REGEX,
+        DEBUG = false,
+      } = env;
+      const url = new URL(request.url);
+      const originHostname = url.hostname;
+      if (
+        !PROXY_HOSTNAME ||
+        (PATHNAME_REGEX && !new RegExp(PATHNAME_REGEX).test(url.pathname)) ||
+        (UA_WHITELIST_REGEX &&
+          !new RegExp(UA_WHITELIST_REGEX).test(
+            request.headers.get("user-agent").toLowerCase()
+          )) ||
+        (UA_BLACKLIST_REGEX &&
+          new RegExp(UA_BLACKLIST_REGEX).test(
+            request.headers.get("user-agent").toLowerCase()
+          )) ||
+        (IP_WHITELIST_REGEX &&
+          !new RegExp(IP_WHITELIST_REGEX).test(
+            request.headers.get("cf-connecting-ip")
+          )) ||
+        (IP_BLACKLIST_REGEX &&
+          new RegExp(IP_BLACKLIST_REGEX).test(
+            request.headers.get("cf-connecting-ip")
+          )) ||
+        (REGION_WHITELIST_REGEX &&
+          !new RegExp(REGION_WHITELIST_REGEX).test(
+            request.headers.get("cf-ipcountry")
+          )) ||
+        (REGION_BLACKLIST_REGEX &&
+          new RegExp(REGION_BLACKLIST_REGEX).test(
+            request.headers.get("cf-ipcountry")
+          ))
+      ) {
+        logError(request, "Invalid");
+        return URL302
+          ? Response.redirect(URL302, 302)
+          : new Response(await nginx(), {
+              headers: {
+                "Content-Type": "text/html; charset=utf-8",
+              },
+            });
+      }
+      url.host = PROXY_HOSTNAME;
+      url.protocol = PROXY_PROTOCOL;
+      const newRequest = createNewRequest(
+        request,
+        url,
+        PROXY_HOSTNAME,
+        originHostname
+      );
+      const originalResponse = await fetch(newRequest);
+      const newResponseHeaders = setResponseHeaders(
+        originalResponse,
+        PROXY_HOSTNAME,
+        originHostname,
+        DEBUG
+      );
+      const contentType = newResponseHeaders.get("content-type") || "";
+      let body;
+      if (contentType.includes("text/")) {
+        body = await replaceResponseText(
+          originalResponse,
+          PROXY_HOSTNAME,
+          PATHNAME_REGEX,
+          originHostname
+        );
+      } else {
+        body = originalResponse.body;
+      }
+      return new Response(body, {
+        status: originalResponse.status,
+        headers: newResponseHeaders,
+      });
+    } catch (error) {
+      logError(request, `Fetch error: ${error.message}`);
+      return new Response("Internal Server Error", { status: 500 });
+    }
+  },
+};
